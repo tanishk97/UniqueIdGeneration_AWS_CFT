@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CIS AWS Foundations Benchmark - The CIS AWS Foundations Benchmark provides
+  a set of security configuration best practices for AWS. (qs-1nrf3c2if)
+# Metadata:
+Parameters:
+  NoIdInQueue:
+    Type: "String"
+    MinLength: "4"
+    Description: "Please enter the value more than or equal to 1000"
+# Conditions:
+Resources:
+  iamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                - lambda.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+      Description: "Role for uniqueue id lambda"
+      RoleName: "uniqueueIDRole" 
+
+  iampolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: '*'
+            Resource: '*'
+      PolicyName: "unique_id_pol"
+      Roles: 
+        - !Ref iamRole
+  
+  uniqueIdQueue:
+    Type: AWS::SQS::Queue
+    Properties: 
+      ContentBasedDeduplication: True
+      DelaySeconds: 0
+      FifoQueue: True
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 345600 
+      QueueName: "uniqueid.fifo"
+      ReceiveMessageWaitTimeSeconds: 0
+      VisibilityTimeout: 30
+      Tags: 
+        - Key: "Name"
+          Value: "UniqueIdQueue"
+
+  uniqueIdService:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.7
+      Role: !GetAtt iamRole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import time;
+          import random;
+          import datetime;  
+          import re;
+          import boto3
+          import string
+          import os
+
+          def lambda_handler(event, context):
+              
+              tm = 2 #please increase the number of seconds i.e change 2 seconds to anything ( 0 < tm < maximum invocation time of lambda )
+              t_end_time = time.time() + tm; 
+              count = 0;
+              thisset = set();
+              
+              while time.time() < t_end_time: 
+                  uniquetime = re.sub("[ .:-]", "", str(datetime.datetime.now()))
+                  
+                  # joining time with uniqueid generated to make it unique
+                  uniqueInteger = ''.join(random.choices(string.digits, k = 4)) + uniquetime
+                  
+                  thisset.add(uniqueInteger); 
+                  count= count + 1;
+                  
+                  
+              print("Total numbers generated:(in 2 secs)",count);     
+              print("length",len(thisset))   
+              
+              #checking for dupliacte values before entering into queue
+              if len(thisset) == count:
+                  print("no.matched")
+                  for uniqnumber in thisset:
+                      
+                      sendinfifo(uniqnumber)
+                  
+              else:
+                  print("discard")
+              print("Completed")
+          def sendinfifo(uniqnumber):
+              client = boto3.client('sqs')
+              response = client.send_message(
+              QueueUrl=os.environ['qurl'],
+              MessageBody=str(uniqnumber),
+              MessageGroupId='channelgroup'
+              ) 
+      Description: Invoke a function during stack creation.
+      Timeout: 120
+      Environment:
+        Variables:
+          "qurl" : !Ref uniqueIdQueue
+      Tags: 
+        - Key: "Name"
+          Value: "UniqueId_Lambda"
+
+  uniqueIdCheckService:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.7
+      Role: !GetAtt iamRole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              # TODO implement
+              client = boto3.client('sqs')
+              lambda_client = boto3.client('lambda')
+              
+              response = client.get_queue_attributes(
+                  QueueUrl=os.environ['qurl'],
+                  AttributeNames=[
+                      'All'
+                  ]
+              )
+              print(response)
+              
+              mssg_count = response['Attributes']['ApproximateNumberOfMessages']
+              
+              # checking number of id's present in the queue
+              min_no_id = os.environ['numberOfId']
+
+              if(int(mssg_count) > int(min_no_id)):
+                  print("Enough id's")
+              else:
+                  print("Generate more id's ")
+                  lambda_response = lambda_client.invoke(
+                      FunctionName=os.environ["lambdafunc"],
+                      InvocationType='Event'
+                  )
+                  
+                  print(lambda_response) 
+      Description: Invoke a function during stack creation.
+      Timeout: 120
+      Environment:
+        Variables:
+          "qurl" : !Ref uniqueIdQueue
+          "lambdafunc" : !Ref uniqueIdService
+          "numberOfId" : !Ref NoIdInQueue
+      Tags: 
+        - Key: "Name"
+          Value: "UniqueId_Check_Lambda"
+
+  cloudwatcheventrule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Will trigger cft in every 10 mins to generate uuid"
+      Name: "uniqueid_rule"
+      ScheduleExpression: "rate(3 minutes)"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "uniqueIdCheckService"
+              - "Arn"
+          Id: "TargetFunctionV1"
+  
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "uniqueIdCheckService"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "cloudwatcheventrule"
+          - "Arn"
